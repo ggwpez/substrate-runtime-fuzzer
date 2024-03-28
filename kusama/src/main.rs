@@ -11,12 +11,16 @@ use sp_consensus_babe::{
     digests::{PreDigest, SecondaryPlainPreDigest},
     Slot, BABE_ENGINE_ID,
 };
+use sp_core::crypto::Ss58Codec;
+use frame_remote_externalities::{
+	Builder, Mode, OfflineConfig, SnapshotConfig,
+};
 use sp_runtime::{
     traits::{Dispatchable, Header},
     Digest, DigestItem, Storage,
 };
 use staging_kusama_runtime::{
-    AllPalletsWithSystem, Executive, Runtime, RuntimeCall, RuntimeOrigin, UncheckedExtrinsic,
+    AllPalletsWithSystem, Executive, Block, Runtime, RuntimeCall, RuntimeOrigin, UncheckedExtrinsic,
 };
 use std::time::{Duration, Instant};
 use substrate_runtime_fuzzer::*;
@@ -70,110 +74,20 @@ fn recursively_find_call(call: RuntimeCall, matches_on: fn(RuntimeCall) -> bool)
 }
 
 fn main() {
-    let endowed_accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
-
-    let genesis_storage: Storage = {
-        use staging_kusama_runtime as kusama;
-
-        let initial_authorities: Vec<Authority> = vec![Authority {
-            account: [0; 32].into(),
-            grandpa: GrandpaId::from_slice(&[0; 32]).unwrap(),
-            babe: BabeId::from_slice(&[0; 32]).unwrap(),
-            beefy: sp_application_crypto::ecdsa::Public::from_raw([0u8; 33]).into(),
-            im_online: ImOnlineId::from_slice(&[0; 32]).unwrap(),
-            validator: ValidatorId::from_slice(&[0; 32]).unwrap(),
-            assignment: AssignmentId::from_slice(&[0; 32]).unwrap(),
-            authority_discovery: AuthorityDiscoveryId::from_slice(&[0; 32]).unwrap(),
-        }];
-
-        let stakers = vec![(
-            [0; 32].into(),
-            [0; 32].into(),
-            STASH,
-            StakerStatus::Validator,
-        )];
-
-        let _num_endowed_accounts = endowed_accounts.len();
-
-        const ENDOWMENT: Balance = 10_000_000 * UNITS;
-        const STASH: Balance = ENDOWMENT / 1000;
-
-        kusama::RuntimeGenesisConfig {
-            system: Default::default(),
-            balances: kusama::BalancesConfig {
-                // Configure endowed accounts with initial balance of 1 << 60.
-                balances: endowed_accounts
-                    .iter()
-                    .cloned()
-                    .map(|k| (k, 1 << 60))
-                    .collect(),
-            },
-            indices: kusama::IndicesConfig { indices: vec![] },
-            session: kusama::SessionConfig {
-                keys: initial_authorities
-                    .iter()
-                    .map(|x| {
-                        (
-                            x.account.clone(),
-                            x.account.clone(),
-                            kusama::SessionKeys {
-                                grandpa: x.grandpa.clone(),
-                                babe: x.babe.clone(),
-                                beefy: x.beefy.clone(),
-                                im_online: x.im_online.clone(),
-                                para_validator: x.validator.clone(),
-                                para_assignment: x.assignment.clone(),
-                                authority_discovery: x.authority_discovery.clone(),
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            },
-            beefy: Default::default(),
-            staking: kusama::StakingConfig {
-                validator_count: initial_authorities.len() as u32,
-                minimum_validator_count: initial_authorities.len() as u32,
-                invulnerables: vec![[0; 32].into()],
-                slash_reward_fraction: Perbill::from_percent(10),
-                stakers,
-                ..Default::default()
-            },
-            babe: kusama::BabeConfig {
-                authorities: Default::default(),
-                epoch_config: Some(kusama::BABE_GENESIS_EPOCH_CONFIG),
-                ..Default::default()
-            },
-            grandpa: Default::default(),
-            im_online: Default::default(),
-            authority_discovery: Default::default(),
-            claims: kusama::ClaimsConfig {
-                claims: vec![],
-                vesting: vec![],
-            },
-            vesting: kusama::VestingConfig { vesting: vec![] },
-            treasury: Default::default(),
-            hrmp: Default::default(),
-            configuration: kusama::ConfigurationConfig {
-                config: Default::default(),
-            },
-            paras: Default::default(),
-            xcm_pallet: Default::default(),
-            nomination_pools: kusama::NominationPoolsConfig {
-                min_create_bond: 1 << 43,
-                min_join_bond: 1 << 42,
-                ..Default::default()
-            },
-            nis_counterpart_balances: Default::default(),
-        }
-        .build_storage()
-        .unwrap()
-    };
+    //let mut externalities = Externalities::new(genesis_storage.clone());
+    let state_snapshot = SnapshotConfig::new("../kusama.snap");
+    // some accounts with lots of balance:
+    let endowed_accounts = vec![
+        AccountId::from_ss58check("EGP7XztdTosm1EmaATZVMjSWujGEj9nNidhjqA2zZtttkFg").unwrap(),
+        AccountId::from_ss58check("E7ncQKp4xayUoUdpraxBjT7NzLoayLJA4TuPcKKboBkJ5GH").unwrap(),
+        AccountId::from_ss58check("GXPPBuUaZYYYvsEquX55AQ1MRvgZ96kniEKyAVDSdv1SX96").unwrap(),
+    ];
 
     ziggy::fuzz!(|data: &[u8]| {
         let mut iteratable = Data::from_data(data);
 
         // Max weight for a block.
-        let max_weight: Weight = Weight::from_parts(WEIGHT_REF_TIME_PER_SECOND * 2, 0);
+        let max_weight: Weight = Weight::from_parts(WEIGHT_REF_TIME_PER_SECOND * 2, 5_000_000);
 
         let extrinsics: Vec<(Option<u32>, usize, RuntimeCall)> =
             iteratable.extract_extrinsics::<RuntimeCall>();
@@ -183,7 +97,13 @@ fn main() {
         }
 
         // `externalities` represents the state of our mock chain.
-        let mut externalities = Externalities::new(genesis_storage.clone());
+        let mut externalities = futures::executor::block_on(
+            Builder::<Block>::default()
+            .mode(Mode::Offline(
+                OfflineConfig { state_snapshot: state_snapshot.clone() },
+            ))
+            .build())
+            .unwrap();
 
         let mut current_block: u32 = 1;
         let mut current_timestamp: u64 = INITIAL_TIMESTAMP;
