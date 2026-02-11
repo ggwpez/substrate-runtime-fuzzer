@@ -1,0 +1,17 @@
+[server]
+ssh_target = "scaleway"           # ssh alias or user@host
+
+[fuzzer]
+target = "asset-hub-polkadot"     # subdirectory under runtimes/
+jobs = 0                          # 0 = nproc - 1 (all available)
+extra_args = "--no-honggfuzz"     # extra args passed to cargo ziggy fuzz
+repo_dir = "/root/substrate-runtime-fuzzer"  # where the repo lives on server
+
+[updates]
+interval_hours = 0.017            # ~1 minute; for testing (use 168 for production)
+git_remote = "https://github.com/polkadot-fellows/runtimes.git"
+git_branch = "main"
+
+[reporting]
+failure_script = "./handle_failure.py"  # script called on new crash
+crash_log = "crashes.log"               # file that handle_failure.py appends to
