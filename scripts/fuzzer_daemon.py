@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     "updates": {
         "interval_hours": 168,
         "git_remote": "https://github.com/polkadot-fellows/runtimes.git",
-        "git_branch": "main",
+        "git_ref": "main",
     },
     "reporting": {
         "failure_script": "./handle_failure.py",
@@ -142,24 +142,37 @@ def setup_logging(repo_dir: str):
 # Cargo.toml modification
 # ---------------------------------------------------------------------------
 
-def modify_cargo_toml_for_branch(cargo_toml_path: str, branch: str) -> bool:
-    """Replace tag = "v..." with branch = "<branch>" for polkadot-fellows deps."""
+def _is_tag_ref(ref: str) -> bool:
+    """Check if a git ref looks like a tag (e.g. v1.2.3)."""
+    return bool(re.match(r"^v\d", ref))
+
+
+def modify_cargo_toml_git_ref(cargo_toml_path: str, git_ref: str) -> bool:
+    """Update polkadot-fellows/runtimes.git deps to use the given git ref.
+
+    Detects whether git_ref is a tag (v1.2.3) or branch name and sets
+    the appropriate Cargo.toml key (tag = "..." or branch = "...").
+    """
     with open(cargo_toml_path, "r") as f:
         content = f.read()
 
+    is_tag = _is_tag_ref(git_ref)
+    new_key = f'tag = "{git_ref}"' if is_tag else f'branch = "{git_ref}"'
+
+    # Replace any existing tag = "..." or branch = "..." on runtimes.git lines
     new_content = re.sub(
-        r'(polkadot-fellows/runtimes\.git[^}]*?)tag\s*=\s*"v[^"]*"',
-        rf'\1branch = "{branch}"',
+        r'(polkadot-fellows/runtimes\.git[^}]*?)(?:tag|branch)\s*=\s*"[^"]*"',
+        rf"\1{new_key}",
         content,
     )
 
     if content != new_content:
         with open(cargo_toml_path, "w") as f:
             f.write(new_content)
-        logging.info("Updated %s to use branch = \"%s\"", cargo_toml_path, branch)
+        logging.info("Updated %s to use %s", cargo_toml_path, new_key)
         return True
 
-    logging.info("Cargo.toml already uses branch references")
+    logging.info("Cargo.toml already uses %s", new_key)
     return False
 
 
@@ -184,38 +197,26 @@ def run_cmd(cmd: list[str], cwd: str = None, env: dict = None, timeout: int = No
 
 
 def update_and_build(config: dict) -> bool:
-    """Pull latest code, cargo update, and rebuild. Returns True on success."""
+    """Update runtimes git dep to latest main commit and rebuild."""
     repo_dir = get_config(config, "fuzzer", "repo_dir")
     target = get_config(config, "fuzzer", "target")
-    branch = get_config(config, "updates", "git_branch")
+    git_ref = get_config(config, "updates", "git_ref")
     runtimes_dir = os.path.join(repo_dir, "runtimes")
     target_dir = os.path.join(runtimes_dir, target)
 
-    # 1. git pull --rebase
-    logging.info("Pulling latest changes...")
-    result = run_cmd(["git", "pull", "--rebase"], cwd=repo_dir)
-    if result.returncode != 0:
-        logging.warning("git pull --rebase failed, trying stash approach...")
-        run_cmd(["git", "stash"], cwd=repo_dir)
-        result = run_cmd(["git", "pull", "--rebase"], cwd=repo_dir)
-        if result.returncode != 0:
-            logging.error("git pull failed even with stash: %s", result.stderr)
-            run_cmd(["git", "stash", "pop"], cwd=repo_dir)
-            return False
-        run_cmd(["git", "stash", "pop"], cwd=repo_dir)
-
-    # 2. Ensure Cargo.toml uses branch refs
+    # 1. Ensure Cargo.toml points to the configured git ref
     cargo_toml = os.path.join(runtimes_dir, "Cargo.toml")
-    modify_cargo_toml_for_branch(cargo_toml, branch)
+    modify_cargo_toml_git_ref(cargo_toml, git_ref)
 
-    # 3. cargo update (picks up latest commit on branch)
-    logging.info("Running cargo update...")
-    result = run_cmd(["cargo", "update"], cwd=runtimes_dir)
+    # 2. cargo update for the target runtime package to pick up latest commit
+    runtime_crate = target + "-runtime"
+    logging.info("Running cargo update -p %s...", runtime_crate)
+    result = run_cmd(["cargo", "update", "-p", runtime_crate], cwd=runtimes_dir)
     if result.returncode != 0:
         logging.error("cargo update failed: %s", result.stderr)
         return False
 
-    # 4. Build
+    # 3. Build
     logging.info("Building fuzzer for %s...", target)
     result = run_cmd(
         ["cargo", "ziggy", "build"],
@@ -305,14 +306,19 @@ def run_fuzzer_cycle(config: dict, duration_hours: float):
     if extra_args:
         cmd.extend(extra_args.split())
 
+    # Clean up stale shared memory segments from previous AFL runs
+    subprocess.run("ipcs -m | awk '$3 == \"root\" {print $2}' | xargs -r -I{} ipcrm -m {}", shell=True, capture_output=True)
+
     logging.info("Starting fuzzer: %s", " ".join(cmd))
     env = {**os.environ, "SKIP_WASM_BUILD": "1"}
+    fuzzer_log = os.path.join(target_dir, "fuzzer_output.log")
+    fuzzer_log_fh = open(fuzzer_log, "a")
     proc = subprocess.Popen(
         cmd,
         cwd=target_dir,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=fuzzer_log_fh,
+        stderr=fuzzer_log_fh,
     )
 
     # Start crash monitor thread
@@ -324,31 +330,78 @@ def run_fuzzer_cycle(config: dict, duration_hours: float):
     )
     monitor_thread.start()
 
-    # Wait for the configured duration
+    # Ziggy may stay alive (TUI mode) or exit after spawning AFL.
+    # Either way, we wait for the configured duration then stop everything.
     duration_secs = duration_hours * 3600
-    logging.info("Fuzzer running for %.1f hours (%.0f seconds)", duration_hours, duration_secs)
+    start_time = time.monotonic()
+    logging.info("Fuzzer running for %.2f hours (%.0f seconds)", duration_hours, duration_secs)
 
     try:
         proc.wait(timeout=duration_secs)
-        # Fuzzer exited on its own
-        logging.warning("Fuzzer exited early with code %d", proc.returncode)
+        logging.info("Ziggy exited with code %d", proc.returncode)
+        # Ziggy exited but AFL instances may still be running — sleep remaining time
+        elapsed = time.monotonic() - start_time
+        remaining = duration_secs - elapsed
+        if remaining > 0:
+            afl_count = _count_afl_instances(target_dir)
+            if afl_count > 0 and proc.returncode == 0:
+                logging.info("Ziggy exited but %d AFL instances still running, sleeping %.0fs", afl_count, remaining)
+                time.sleep(remaining)
     except subprocess.TimeoutExpired:
-        # Duration elapsed, gracefully stop
-        logging.info("Fuzzing duration elapsed, sending SIGINT...")
+        # Duration elapsed, stop ziggy and AFL
+        logging.info("Fuzzing duration elapsed, stopping...")
         proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=60)
-            logging.info("Fuzzer stopped gracefully")
+            proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            logging.warning("Fuzzer did not stop in 60s, sending SIGKILL")
             proc.kill()
             proc.wait()
+
+    # Always clean up AFL instances
+    _stop_afl_instances(target_dir)
+    fuzzer_log_fh.close()
 
     # Stop crash monitor
     stop_event.set()
     monitor_thread.join(timeout=10)
 
-    return proc.returncode
+    return 0
+
+
+def _count_afl_instances(target_dir: str) -> int:
+    """Count running afl-fuzz processes for this target."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-c", "-f", "afl-fuzz.*" + os.path.basename(target_dir)],
+            capture_output=True, text=True,
+        )
+        return int(result.stdout.strip()) if result.returncode == 0 else 0
+    except Exception:
+        return 0
+
+
+def _stop_afl_instances(target_dir: str):
+    """Send SIGINT to all afl-fuzz processes for this target, then wait."""
+    try:
+        result = subprocess.run(
+            ["pkill", "-INT", "-f", "afl-fuzz.*" + os.path.basename(target_dir)],
+            capture_output=True, text=True,
+        )
+        logging.info("Sent SIGINT to AFL instances (pkill exit: %d)", result.returncode)
+    except Exception:
+        logging.exception("Failed to send SIGINT to AFL")
+
+    # Wait for processes to exit
+    time.sleep(5)
+
+    # Force kill any remaining
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", "afl-fuzz.*" + os.path.basename(target_dir)],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +415,11 @@ def main():
     config = load_config(config_path)
     repo_dir = get_config(config, "fuzzer", "repo_dir")
     interval_hours = get_config(config, "updates", "interval_hours")
+
+    # Ensure cargo is in PATH (non-interactive shells may not source .cargo/env)
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if cargo_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = cargo_bin + ":" + os.environ.get("PATH", "")
 
     setup_logging(repo_dir)
     logging.info("=" * 60)
